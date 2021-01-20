@@ -1,4 +1,7 @@
 
+#[path= "common-func.rs"]
+mod cf;
+
 use ash::version::{EntryV1_0, InstanceV1_0, DeviceV1_0};
 use ash::vk;
 use ash::extensions::khr::{Win32Surface, Surface, Swapchain};
@@ -7,13 +10,16 @@ use thiserror::Error;
 use anyhow::Result;
 
 #[derive(Error, Debug,)]
-pub enum MyError{
-    #[error("没有找到设备！\n请检测是否安装Vulkan驱动")]
+pub enum ErrorUse{
+    // failed to find GPUs with Vulkan support!
+    #[error("找不到支持Vulkan的GPU！\n请检测是否安装Vulkan驱动")]
     NoDevice,
-    #[error("Vulkan版本太低！")]
-    OutdatedVersion,
+    // failed to find a suitable GPU!
     #[error("设备不兼容！\n无法支持相关操作")]
     DeviceNoSupport,
+    #[error("Vulkan版本太低！")]
+    OutdatedVersion,
+   
 
 }
 pub struct Vulkan{
@@ -24,6 +30,7 @@ pub struct Vulkan{
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     graphics_queue: vk::Queue,
+    transfer_queue: vk::Queue,
     swapchain: SwapchainUse,
     renderpass: vk::RenderPass,
     pipeline: Pipeline,
@@ -34,28 +41,20 @@ impl Vulkan{
 
     pub fn new(hwnd: vk::HWND, hinstance: vk::HINSTANCE) -> Result<Vulkan> {
         let entry = ash::Entry::new()?;
-        let instance = create_instance(&entry)?;
+        let instance = cf::create_instance(&entry)?;
         let debug = DebugUse::new(&entry, &instance)?;
         let surface = SurfaceUse::new(&entry, &instance, hwnd, hinstance)?;        
-        let (physical_device, indices) = pick_physical_device(&instance, &surface)?;
-
-        //创建逻辑设备
-        let device_extension_name_pointers: Vec<*const i8> = vec![Swapchain::name().as_ptr()];
-        let priority = vec![1.0f32];
-        let vqueue_info = indices.device_queue_create_info(&priority);
-        let device_create_info = vk::DeviceCreateInfo::builder()
-                .queue_create_infos(&vqueue_info)
-                .enabled_extension_names(&device_extension_name_pointers)
-        ;        
-        let device =  unsafe { instance.create_device(physical_device, &device_create_info, None)? };
-        let graphics_queue = unsafe {device.get_device_queue(indices.0.unwrap(), 0) };
+        let (physical_device, indices) = cf::pick_physical_device(&instance, &surface)?;
+        let device = cf::create_logical_device(&instance, physical_device, indices)?;
+        let graphics_queue = unsafe {device.get_device_queue(indices.graphics.unwrap(), 0) };
+        let transfer_queue = unsafe {device.get_device_queue(indices.transfer.unwrap(), 0) };
         
         let mut swapchain = SwapchainUse::new(&instance, &device, &surface, physical_device)?;
         let renderpass = Self::create_render_pass(&device, swapchain.image_format)?;
         swapchain.create_framebuffer(&device, renderpass)?;
         let pipeline = Pipeline::new(&device, swapchain.image_extent, renderpass)?;
         
-        let graphics_command_pool = create_command_pool(&device, indices.0.unwrap())?;
+        let graphics_command_pool = create_command_pool(&device, indices.graphics.unwrap())?;
         let graphics_command_buffers = create_command_buffers(&device, graphics_command_pool,
                      swapchain.image_count as u32, 
                      vk::CommandBufferLevel::PRIMARY,
@@ -76,6 +75,7 @@ impl Vulkan{
             physical_device,
             device,
             graphics_queue,
+            transfer_queue,
             swapchain,
             renderpass,
             pipeline,
@@ -84,13 +84,7 @@ impl Vulkan{
         })
 
     }   
-    pub fn close(&self){
-            unsafe {
-                self.device.device_wait_idle().expect("something wrong while waiting");
-                self.device.queue_wait_idle(self.graphics_queue).expect("something wrong while waiting");
-
-        }
-    }
+ 
     pub fn draw_frame(&self){
      
         let index = self.swapchain.current_image.get();
@@ -185,7 +179,7 @@ impl Vulkan{
 impl Drop for Vulkan{
     fn drop(&mut self){
         unsafe {
-            // self.device.device_wait_idle().expect("something wrong while waiting");
+            self.device.device_wait_idle().expect("something wrong while waiting");
             self.device.destroy_command_pool(self.graphics_command_pool, None);
             self.pipeline.cleanup(&self.device);
             self.device.destroy_render_pass(self.renderpass, None);
@@ -352,7 +346,6 @@ impl SwapchainUse {
                 Self::choose_swap_surface_format(surface.get_physical_device_surface_formats(physical_device)?);
         let image_format = surface_format.format;
         let image_extent = surface_capabilities.current_extent;
-        //使用交换链支持的最小图像个数 +1 数量的图像来实现三倍缓冲：
         let image_count = 3.max(surface_capabilities.min_image_count).min(surface_capabilities.max_image_count);
         
         let swap_info = vk::SwapchainCreateInfoKHR::builder()
@@ -426,7 +419,7 @@ impl SwapchainUse {
             swapchain,
             image_format,
             image_extent,
-            image_count,
+            image_count,    
             // images,
             imageviews,
             framebuffers,
@@ -494,70 +487,37 @@ impl SwapchainUse {
     //选择呈现模式
     #[inline]
     fn choose_swap_present_mode(available: Vec<vk::PresentModeKHR>)-> vk::PresentModeKHR{
-        let  mut best_mode = vk::PresentModeKHR::FIFO;
         for mode in available {
             if mode == vk::PresentModeKHR::MAILBOX { return mode;}
-            else if mode == vk::PresentModeKHR::IMMEDIATE {
-                best_mode = mode;
-            }
         }
-        best_mode
+        vk::PresentModeKHR::FIFO
     }
 
 
 }
 
 
-//很少需要一个以上队列,可以在多个线程创建指令缓冲，然后在主线程一次将它们全部提交，降低调用开销。
-#[derive(Default, )]
-struct QueueFamilyIndices( 
-    Option<u32>,    //vk::QueueFlags::GRAPHICS
+/// 很少需要一个以上队列,可以在多个线程创建指令缓冲，然后在主线程一次将它们全部提交，降低调用开销。
+/// SAFETY: in the pick_phsical_device(),need is_complete() return true
+///         so i unwrap() directly after that.
+#[derive(Default, Clone, Copy)]
+struct QueueFamilyIndices{
     //呈现(Presentation) 和 绘制 强制同一个queueFamilyIndex
-
-        
-);
+    graphics: Option<u32>,    //vk::QueueFlags::GRAPHICS
+    transfer: Option<u32>,    //vk::QueueFlags::TRANSFER
+}
 impl QueueFamilyIndices{
-    //返回为true,后面直接unwrap..
+    #[inline]
+    fn new()->Self{
+        Default::default()
+    }
     #[inline]
     fn is_complete(&self) -> bool {
-         self.0.is_some()
-    }
-    fn device_queue_create_info(&self, priority: &[f32])-> Vec<vk::DeviceQueueCreateInfo>{
-        vec![
-            vk::DeviceQueueCreateInfo::builder()
-            .queue_family_index(self.0.unwrap())
-            .queue_priorities(priority)
-            .build(),
-
-        ]
-    }
+         self.graphics.is_some() && self.transfer.is_some()
+    }    
 }
 
-fn find_queue_families<I: InstanceV1_0>(
-    instance: &I, 
-    physical_device: vk::PhysicalDevice,
-    surface: &SurfaceUse,
-)-> Result<QueueFamilyIndices>{
-   let queue_family_properties =  unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
 
-   let mut find: QueueFamilyIndices = Default::default();
-   for (i, queue_family) in (0u32..).zip(queue_family_properties){
-       if queue_family.queue_count>0
-        && queue_family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-        //此处强制要求 绘制和呈现同一队列
-        && surface.get_physical_device_surface_support(physical_device, i)?
-        {
-            find.0 = Some(i);
-        }
-
-        if find.is_complete(){
-            break;
-        }
-       
-   }
-   Ok(find)
-
-}
 #[inline]
 fn create_command_pool(device: &impl DeviceV1_0, family_index: u32)->Result<vk::CommandPool, vk::Result>{
     let pool_info = vk::CommandPoolCreateInfo::builder()
@@ -744,114 +704,3 @@ impl Pipeline {
     }
 }
 
-
-
-
-//设备需求检测
-#[inline]
-fn is_device_suitable<I: InstanceV1_0>(
-    instance: &I, 
-    device: vk::PhysicalDevice,
-    surface: &SurfaceUse,
-)-> Result<(bool, QueueFamilyIndices)> {
-    
-    let family_indices = find_queue_families(instance, device, surface)?;
-    if family_indices.is_complete() 
-        //交换链需要至少支持一种图像格式和一种支持我们的窗口表面的呈现模式
-        &&!surface.get_physical_device_surface_formats(device)?.is_empty()
-        &&!surface.get_physical_device_surface_present_modes(device)?.is_empty()    
-    {
-        Ok((true, family_indices))
-    }else{
-        Ok((false, family_indices))
-    }
-}
-
-fn pick_physical_device<I: InstanceV1_0>(instance: &I, surface: &SurfaceUse)
--> Result<(vk::PhysicalDevice, QueueFamilyIndices)>{
-    let phys_devs = unsafe { instance.enumerate_physical_devices()? };
-    if phys_devs.is_empty(){
-        return Err(From::from(MyError::NoDevice));
-    }
-    let mut picked: Option<(vk::PhysicalDevice, QueueFamilyIndices)> = None;
-    for device in phys_devs {
-        
-        let properties = unsafe{instance.get_physical_device_properties(device)};
-     
-        if properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
-            let  (flag, indices) = is_device_suitable(instance, device, surface)?;
-            if  flag{
-                picked = Some((device, indices));
-                break;
-            }
-        }
-    }
-     match picked {
-        Some(x) => Ok(x),
-        None => Err(From::from(MyError::DeviceNoSupport))
-    }
-    // Ok(picked.unwrap())
-}
-
-fn create_instance(
-    entry: &ash::Entry,
-)-> Result<ash::Instance, ash::InstanceError> {
-
-    //need-change.
-
-    let enginename = std::ffi::CString::new("first").unwrap();
-    let appname = std::ffi::CString::new("first").unwrap();
-    let enginev: u32 = vk::make_version(0, 0, 1);
-    let appv: u32 = vk::make_version(0, 0, 1);    
-
-
-    //获取API version, 获取失败 按v1.0算,,V1.0不支持apiVersion,没有.api_version()方法
-    /* 
-    let _apiV: u32 = match entry.try_enumerate_instance_version().unwrap_or(None) {
-        // Vulkan 1.1+
-        Some(version) => version,
-
-        // Vulkan 1.0
-        None => vk::make_version(1, 0, 0),
-    };
-    */
-    let app_info = vk::ApplicationInfo::builder()
-        .application_name(&appname)
-        .application_version(appv)
-        .engine_name(&enginename)
-        .engine_version(enginev)
-        // .api_verion(apiV)
-    ;
-    //启用的扩展
-    let extension_names: Vec<*const i8> = vec![
-        ash::extensions::ext::DebugUtils::name().as_ptr(),
-        ash::extensions::khr::Surface::name().as_ptr(),
-        ash::extensions::khr::Win32Surface::name().as_ptr(),
-    ];
-/* 
-    let mut debugcreateinfo = vk::DebugUtilsMessengerCreateInfoEXT::builder()
-        .message_severity(
-            vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
-                | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
-        )
-        .message_type(
-            vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
-                | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
-        )
-        .pfn_user_callback(Some(vulkan_debug_utils_callback));
-
-        */
-  
-    let layer_names =  vec![std::ffi::CString::new("VK_LAYER_KHRONOS_validation").unwrap().into_raw() as *const i8];
-    let instance_create_info = vk::InstanceCreateInfo::builder()
-        // .push_next(&mut debugcreateinfo)
-        .application_info(&app_info)
-        .enabled_extension_names(&extension_names)
-        .enabled_layer_names(&layer_names)
-    ;
-   
-
-    unsafe { entry.create_instance(&instance_create_info, None) }        
-}

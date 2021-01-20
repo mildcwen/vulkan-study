@@ -1,6 +1,4 @@
 
-// #[path = "vk-init.rs"]
-// mod init;
 mod render;
 
 use render::Vulkan;
@@ -18,7 +16,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                render.close();
                 *controlflow = winit::event_loop::ControlFlow::Exit;
             },
             Event::MainEventsCleared => {
@@ -26,7 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
                 window.request_redraw();
 
             },
-            Event::RedrawRequested(_) => {
+            // Event::RedrawRequested(_) => {
+            Event::RedrawEventsCleared => {
                 //render here (later)
             render.draw_frame();
             },
